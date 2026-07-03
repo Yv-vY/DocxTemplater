@@ -17,6 +17,11 @@ namespace DocxTemplater.Formatter
     {
         private const string RelationshipNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
+        // Remembers which relationship ids have already been imported per (template value, target part) so that
+        // inserting the same document multiple times (e.g. in a loop) reuses the copied parts instead of
+        // embedding the same image again for every insertion.
+        private readonly Dictionary<(object TemplateValue, OpenXmlPart TargetPart), Dictionary<string, string>> m_importedRelationshipIds = new();
+
         public bool CanHandle(Type type, string prefix)
         {
             return prefix.Equals("template", StringComparison.CurrentCultureIgnoreCase) ||
@@ -33,7 +38,7 @@ namespace DocxTemplater.Formatter
             var loaded = LoadTemplateElements(formatterContext.Args[0]?.Trim(), templateContext.ModelLookup);
             // Keep the (optional) source document open until the merge completes, so its parts can be copied;
             // disposed at the end of the method. Null for string / OpenXmlElement templates.
-            using var loadedSource = loaded.Source;
+            using var loadedSource = loaded.SourceDocument;
             var templateElement = loaded.Element ?? throw new OpenXmlTemplateException("Template is null or is not a valid OpenXML template");
 
             // Resolve the destination part up front: the table-row / -cell branches remove target's ancestor,
@@ -75,6 +80,12 @@ namespace DocxTemplater.Formatter
                 OpenXmlElement insertionPoint = parent.SplitAfterElement(target).First();
                 foreach (var childParagaphs in body.ChildElements)
                 {
+                    if (childParagaphs is SectionProperties)
+                    {
+                        // a body-level sectPr is only valid as the last child of the body - cloning it into the
+                        // middle of the target body would produce an invalid document and an unwanted section break
+                        continue;
+                    }
                     var clone = childParagaphs.CloneNode(true);
                     insertionPoint = insertionPoint.InsertAfterSelf(clone);
                     insertedElements.Add(clone);
@@ -112,9 +123,15 @@ namespace DocxTemplater.Formatter
             // Re-import parts referenced by the inserted content (images, external links) from the source
             // document into the target part, remapping relationship ids so they resolve. Without this the
             // clones keep the source's relationship ids and the referenced media is lost.
-            if (loaded.SourcePart != null && targetPart != null)
+            var sourcePart = loaded.SourceDocument?.MainDocumentPart;
+            if (sourcePart != null && targetPart != null)
             {
-                ImportReferencedParts(loaded.SourcePart, targetPart, insertedElements);
+                if (!m_importedRelationshipIds.TryGetValue((loaded.Value, targetPart), out var idMap))
+                {
+                    idMap = new Dictionary<string, string>(StringComparer.Ordinal);
+                    m_importedRelationshipIds[(loaded.Value, targetPart)] = idMap;
+                }
+                ImportReferencedParts(sourcePart, targetPart, insertedElements, idMap);
             }
 
             target.RemoveWithEmptyParent();
@@ -122,9 +139,8 @@ namespace DocxTemplater.Formatter
 
         // Copies parts referenced by the inserted elements (via r:embed / r:id / r:link) from the source part
         // into the target part and rewrites the relationship ids on the clones so they resolve in the target.
-        private static void ImportReferencedParts(OpenXmlPart source, OpenXmlPart target, List<OpenXmlElement> insertedElements)
+        private static void ImportReferencedParts(OpenXmlPart source, OpenXmlPart target, List<OpenXmlElement> insertedElements, Dictionary<string, string> idMap)
         {
-            var idMap = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var root in insertedElements)
             {
                 foreach (var element in SelfAndDescendants(root))
@@ -153,15 +169,7 @@ namespace DocxTemplater.Formatter
         private static string CopyRelationship(OpenXmlPart source, OpenXmlPart target, string relationshipId)
         {
             // Resolve the id against the source part's relationships without relying on GetPartById throwing.
-            OpenXmlPart sourcePart = null;
-            foreach (var pair in source.Parts)
-            {
-                if (pair.RelationshipId == relationshipId)
-                {
-                    sourcePart = pair.OpenXmlPart;
-                    break;
-                }
-            }
+            var sourcePart = source.Parts.FirstOrDefault(p => p.RelationshipId == relationshipId).OpenXmlPart;
 
             if (sourcePart is ImagePart image)
             {
@@ -187,7 +195,21 @@ namespace DocxTemplater.Formatter
                 return target.AddExternalRelationship(external.RelationshipType, external.Uri).Id;
             }
 
-            // Other embedded part types (OLE objects, charts, ...) are not copied here.
+            if (sourcePart != null)
+            {
+                // Other embedded part types (charts, OLE objects, ...): AddPart deep-copies a part - including
+                // its relationship tree - when it belongs to another package. Not every part type can be added
+                // to every target part; in that case the reference is left unchanged.
+                try
+                {
+                    return target.GetIdOfPart(target.AddPart(sourcePart));
+                }
+                catch (Exception)
+                {
+                    return null;
+                }
+            }
+
             return null;
         }
 
@@ -247,79 +269,44 @@ namespace DocxTemplater.Formatter
             }
             if (value is byte[] byteArray)
             {
-                var memStream = new MemoryStream(byteArray);
-                return OpenFromDocumentStream(memStream, ownsStream: true);
+                // the fresh MemoryStream needs no disposal - key the import cache on the byte[] itself
+                return OpenFromDocumentStream(new MemoryStream(byteArray), byteArray);
             }
 
             if (value is Stream stream)
             {
-                return OpenFromDocumentStream(stream, ownsStream: false);
+                return OpenFromDocumentStream(stream, stream);
             }
             throw new OpenXmlTemplateException("Template must be a string, OpenXmlElement, byte[] or Stream");
         }
 
-        // The source document is kept open (returned via LoadedTemplate.Source) so its parts remain readable
-        // while ImportReferencedParts copies them into the target; it is disposed by ApplyFormat.
-        private static LoadedTemplate OpenFromDocumentStream(Stream stream, bool ownsStream)
+        // The source document is kept open (returned via LoadedTemplate.SourceDocument) so its parts remain
+        // readable while ImportReferencedParts copies them into the target; it is disposed by ApplyFormat.
+        private static LoadedTemplate OpenFromDocumentStream(Stream stream, object templateValue)
         {
             stream.Seek(0, SeekOrigin.Begin);
-            WordprocessingDocument doc;
-            try
-            {
-                doc = WordprocessingDocument.Open(stream, false);
-            }
-            catch
-            {
-                if (ownsStream)
-                {
-                    stream.Dispose();
-                }
-                throw;
-            }
+            var doc = WordprocessingDocument.Open(stream, false);
             var body = doc.MainDocumentPart?.Document?.Body;
             if (body == null)
             {
                 doc.Dispose();
-                if (ownsStream)
-                {
-                    stream.Dispose();
-                }
                 return default;
             }
-            IDisposable disposer = ownsStream ? new CompositeDisposable(doc, stream) : doc;
-            return new LoadedTemplate(body, doc.MainDocumentPart, disposer);
+            return new LoadedTemplate(body, doc, templateValue);
         }
 
         private readonly struct LoadedTemplate
         {
-            public LoadedTemplate(OpenXmlCompositeElement element, OpenXmlPart sourcePart, IDisposable source)
+            public LoadedTemplate(OpenXmlCompositeElement element, WordprocessingDocument sourceDocument, object value)
             {
                 Element = element;
-                SourcePart = sourcePart;
-                Source = source;
+                SourceDocument = sourceDocument;
+                Value = value;
             }
 
             public OpenXmlCompositeElement Element { get; }
-            public OpenXmlPart SourcePart { get; }
-            public IDisposable Source { get; }
-        }
-
-        private sealed class CompositeDisposable : IDisposable
-        {
-            private readonly IDisposable[] _items;
-
-            public CompositeDisposable(params IDisposable[] items)
-            {
-                _items = items;
-            }
-
-            public void Dispose()
-            {
-                foreach (var item in _items)
-                {
-                    item?.Dispose();
-                }
-            }
+            public WordprocessingDocument SourceDocument { get; }
+            public object Value { get; }
         }
     }
 }

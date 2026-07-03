@@ -8,7 +8,7 @@ using PIC = DocumentFormat.OpenXml.Drawing.Pictures;
 namespace DocxTemplater.Test
 {
     [TestFixture]
-    public class SubTemplateImageImportTest
+    internal class SubTemplateImageImportTest
     {
         // Regression test: when a document is inserted via the 'template' formatter, images embedded in the
         // inserted document must be preserved. The body content is cloned into the target, so the referenced
@@ -80,6 +80,91 @@ namespace DocxTemplater.Test
             using var copiedBytes = new MemoryStream();
             copiedStream.CopyTo(copiedBytes);
             Assert.That(copiedBytes.ToArray(), Is.EqualTo(imageBytes), "the image content must be copied into the target document");
+        }
+
+        // Regression test: a body-level sectPr of the inserted document must not be cloned into the middle of
+        // the target body - it is only valid as the last child and would cause an unwanted section break.
+        [Test]
+        public void SubTemplateInsert_DoesNotCloneSectionPropertiesIntoTargetBody()
+        {
+            using var subDocStream = new MemoryStream();
+            using (var subDocument = WordprocessingDocument.Create(subDocStream, WordprocessingDocumentType.Document))
+            {
+                var subMainPart = subDocument.AddMainDocumentPart();
+                subMainPart.Document = new Document(new Body(
+                    new Paragraph(new Run(new Text("Inserted Content"))),
+                    new SectionProperties()));
+                subMainPart.Document.Save();
+            }
+
+            using var memStream = new MemoryStream();
+            using (var wpDocument = WordprocessingDocument.Create(memStream, WordprocessingDocumentType.Document))
+            {
+                var mainPart = wpDocument.AddMainDocumentPart();
+                mainPart.Document = new Document(new Body(
+                    new Paragraph(new Run(new Text("Start of Document"))),
+                    new Paragraph(new Run(new Text("{{ds}:template('ds.SubDocument')}"))),
+                    new Paragraph(new Run(new Text("End of Document")))));
+            }
+            memStream.Position = 0;
+
+            var docTemplate = new DocxTemplate(memStream);
+            docTemplate.BindModel("ds", new { SubDocument = subDocStream.ToArray() });
+            var result = docTemplate.Process();
+            docTemplate.Validate();
+            result.Position = 0;
+
+            using var document = WordprocessingDocument.Open(result, false);
+            var body = document.MainDocumentPart.Document.Body;
+            Assert.That(body.InnerText, Does.Contain("Inserted Content"));
+            Assert.That(body.Descendants<SectionProperties>(), Is.Empty, "the inserted document's sectPr must not be cloned into the target body");
+        }
+
+        // Regression test: inserting the same document multiple times must reuse the imported image part
+        // instead of embedding a new copy of the image for every insertion.
+        [Test]
+        public void SubTemplateInsert_SameDocumentInsertedTwice_ImagePartIsReused()
+        {
+            var imageBytes = File.ReadAllBytes("Resources/testImage.jpg");
+
+            using var subDocStream = new MemoryStream();
+            using (var subDocument = WordprocessingDocument.Create(subDocStream, WordprocessingDocumentType.Document))
+            {
+                var subMainPart = subDocument.AddMainDocumentPart();
+                subMainPart.Document = new Document(new Body());
+                var imagePart = subMainPart.AddImagePart(ImagePartType.Jpeg);
+                using (var imageStream = new MemoryStream(imageBytes))
+                {
+                    imagePart.FeedData(imageStream);
+                }
+                var relationshipId = subMainPart.GetIdOfPart(imagePart);
+                subMainPart.Document.Body.Append(
+                    new Paragraph(new Run(CreateInlineImage(relationshipId, 990000L, 792000L))));
+                subMainPart.Document.Save();
+            }
+
+            using var memStream = new MemoryStream();
+            using (var wpDocument = WordprocessingDocument.Create(memStream, WordprocessingDocumentType.Document))
+            {
+                var mainPart = wpDocument.AddMainDocumentPart();
+                mainPart.Document = new Document(new Body(
+                    new Paragraph(new Run(new Text("{{ds}:template('ds.SubDocument')}"))),
+                    new Paragraph(new Run(new Text("{{ds}:template('ds.SubDocument')}")))));
+            }
+            memStream.Position = 0;
+
+            var docTemplate = new DocxTemplate(memStream);
+            docTemplate.BindModel("ds", new { SubDocument = subDocStream.ToArray() });
+            var result = docTemplate.Process();
+            docTemplate.Validate();
+            result.Position = 0;
+
+            using var document = WordprocessingDocument.Open(result, false);
+            var mainDocumentPart = document.MainDocumentPart;
+            var blips = mainDocumentPart.Document.Body.Descendants<A.Blip>().ToList();
+            Assert.That(blips, Has.Count.EqualTo(2), "both insertions must contain the image drawing");
+            Assert.That(blips.Select(b => b.Embed?.Value).Distinct().Count(), Is.EqualTo(1), "both insertions must reference the same image part");
+            Assert.That(mainDocumentPart.ImageParts.Count(), Is.EqualTo(1), "the image part must be imported only once");
         }
 
         private static Drawing CreateInlineImage(string relationshipId, long cx, long cy)
