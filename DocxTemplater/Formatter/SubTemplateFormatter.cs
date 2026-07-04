@@ -45,9 +45,31 @@ namespace DocxTemplater.Formatter
             // after which target.GetRoot() can no longer reach the owning part.
             var targetPart = (target.GetRoot() as OpenXmlPartRootElement)?.OpenXmlPart;
 
-            if (formatterContext.Args.Length > 1)
+            // Optional args after the template name: a selector (p/run/tr/tc) and/or "raw".
+            // "raw" inserts the sub-document verbatim, WITHOUT running the template engine over it - for
+            // embedding user-authored / untrusted documents whose text may legitimately contain {{ }} that
+            // must survive literally (e.g. code samples or template-injection findings in a security report).
+            string selector = null;
+            var raw = false;
+            foreach (var arg in formatterContext.Args.Skip(1))
             {
-                var selector = formatterContext.Args[1];
+                var value = arg?.Trim();
+                if (string.Equals(value, "raw", StringComparison.OrdinalIgnoreCase))
+                {
+                    raw = true;
+                }
+                else if (value is "p" or "run" or "tr" or "tc")
+                {
+                    selector = value;
+                }
+                else
+                {
+                    throw new OpenXmlTemplateException($"Invalid template formatter argument '{value}'");
+                }
+            }
+
+            if (selector != null)
+            {
                 templateElement = selector switch
                 {
                     "p" => templateElement.Descendants<Paragraph>().First(),
@@ -58,17 +80,22 @@ namespace DocxTemplater.Formatter
                 };
             }
 
-            // create a new Template context with replaced ModelLookup
-            var templateModelLookup = new ModelLookup();
-            templateModelLookup.Add("ds", formatterContext.Value);
-            foreach (var models in templateContext.ModelLookup.Models.Skip(1))
+            // Process the sub-document unless "raw" was requested. A verbatim insert skips templating, so the
+            // inserted content's {{ }} tokens, loops and formatters are preserved as literal text.
+            if (!raw)
             {
-                templateModelLookup.Add(models.Key, models.Value);
+                // create a new Template context with replaced ModelLookup
+                var templateModelLookup = new ModelLookup();
+                templateModelLookup.Add("ds", formatterContext.Value);
+                foreach (var models in templateContext.ModelLookup.Models.Skip(1))
+                {
+                    templateModelLookup.Add(models.Key, models.Value);
+                }
+                var variableReplacer = new VariableReplacer(templateModelLookup, templateContext.ProcessSettings);
+                var scriptCompiler = new ScriptCompiler(templateModelLookup, templateContext.ProcessSettings);
+                var processor = new XmlNodeTemplate(templateElement, new TemplateProcessingContext(templateContext.ProcessSettings, templateModelLookup, variableReplacer, scriptCompiler));
+                processor.Process();
             }
-            var variableReplacer = new VariableReplacer(templateModelLookup, templateContext.ProcessSettings);
-            var scriptCompiler = new ScriptCompiler(templateModelLookup, templateContext.ProcessSettings);
-            var processor = new XmlNodeTemplate(templateElement, new TemplateProcessingContext(templateContext.ProcessSettings, templateModelLookup, variableReplacer, scriptCompiler));
-            processor.Process();
 
             // Elements cloned into the target document. Their relationship references (images, external links)
             // still point at the source document's parts and must be re-imported / re-mapped below.
