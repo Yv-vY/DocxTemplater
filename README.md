@@ -417,10 +417,13 @@ The value in front of the formatter (here `ds`) is bound as `ds` *inside* the in
 ---
 ## Content Controls
 
-A Word [content control](https://support.microsoft.com/en-us/office/create-a-template-9bc66f57-cbd0-4a2c-be7c-9b839d3a9019) (a *structured document tag*, `w:sdt`) can be filled from the model by putting a placeholder in its **tag**. Set the control's *Tag* (Developer tab → Properties → Tag) to a placeholder such as `{{ds.Name}}`, and DocxTemplater replaces the control's content with the resolved value:
+A Word [content control](https://support.microsoft.com/en-us/office/create-a-template-9bc66f57-cbd0-4a2c-be7c-9b839d3a9019) (a *structured document tag*, `w:sdt`) can be filled from the model by putting a placeholder in its **tag**. Set the control's *Tag* (Developer tab → Properties → Tag) to a placeholder such as `{{ds.Name}}`, and DocxTemplater replaces the control's content with the resolved value.
+
+This is **opt-in** and off by default (existing templates may contain content-control tags never intended as placeholders). Enable it via `ProcessSettings.EnableContentControlTagBinding`:
 
 ```csharp
-var template = DocxTemplate.Open("template.docx");
+var template = DocxTemplate.Open("template.docx",
+    new ProcessSettings { EnableContentControlTagBinding = true });
 template.BindModel("ds", new { Name = "World", DeliveryDate = new DateTime(2026, 7, 8) });
 template.Save("generated.docx");
 ```

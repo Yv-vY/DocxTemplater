@@ -203,6 +203,13 @@ namespace DocxTemplater.Formatter
         /// </remarks>
         private void ReplaceContentControlValues(OpenXmlElement root, ITemplateProcessingContext templateContext)
         {
+            // Opt-in: content-control tag binding inspects the w:tag of pre-existing controls, which could
+            // change behavior of templates not authored for DocxTemplater. It is off unless explicitly enabled.
+            if (!ProcessSettings.EnableContentControlTagBinding)
+            {
+                return;
+            }
+
             var contentControls = root.Descendants<SdtElement>().ToList();
             if (root is SdtElement rootControl)
             {
@@ -270,6 +277,11 @@ namespace DocxTemplater.Formatter
             var target = PrepareContentControlTarget(contentControl);
             if (target == null)
             {
+                // The value resolved but there is nowhere to put it (e.g. an empty cell/row content control).
+                // Surface this per the error mode instead of silently dropping the resolved value.
+                ApplyContentControlErrorMode(contentControl, tag,
+                    new OpenXmlTemplateException("the resolved value has no text run to fill (empty cell/row content controls are not supported)"),
+                    preparedTarget: null);
                 return;
             }
 

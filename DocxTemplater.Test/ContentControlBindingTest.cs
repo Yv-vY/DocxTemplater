@@ -180,8 +180,63 @@ namespace DocxTemplater.Test
                   <w:sdtContent><w:p><w:r><w:t>x</w:t></w:r></w:p></w:sdtContent>
                 </w:sdt>";
 
-            using var template = new DocxTemplate(CreateTemplate(body));
+            using var template = new DocxTemplate(CreateTemplate(body),
+                new ProcessSettings { EnableContentControlTagBinding = true });
             template.BindModel("ds", new { Name = "World" });
+
+            Assert.Throws<OpenXmlTemplateException>(() => template.Process());
+        }
+
+        [Test]
+        public void PlaceholderTag_IsIgnored_WhenFlagDisabled()
+        {
+            // With the opt-in flag off (the default), a placeholder tag must be left completely alone -
+            // no fill, no content change, no placeholder-flag removal.
+            const string body = @"
+                <w:sdt xmlns:w=""http://schemas.openxmlformats.org/wordprocessingml/2006/main"">
+                  <w:sdtPr><w:tag w:val=""{{ds.Name}}""/><w:showingPlcHdr/></w:sdtPr>
+                  <w:sdtContent><w:p><w:r><w:t>placeholder</w:t></w:r></w:p></w:sdtContent>
+                </w:sdt>";
+
+            MemoryStream result;
+            using (var template = new DocxTemplate(CreateTemplate(body))) // default settings -> flag OFF
+            {
+                template.BindModel("ds", new { Name = "World" });
+                var processed = template.Process();
+                result = new MemoryStream();
+                processed.Position = 0;
+                processed.CopyTo(result);
+                result.Position = 0;
+            }
+
+            using var doc = WordprocessingDocument.Open(result, false);
+            var control = ContentControl(doc.MainDocumentPart.Document.Body, "{{ds.Name}}");
+            Assert.Multiple(() =>
+            {
+                Assert.That(control.InnerText, Is.EqualTo("placeholder"), "the feature is inert when the flag is off");
+                Assert.That(control.SdtProperties.GetFirstChild<ShowingPlaceholder>(), Is.Not.Null,
+                    "the placeholder flag is left in place when the flag is off");
+            });
+        }
+
+        [Test]
+        public void ResolvedValue_WithNoTextTarget_IsSurfaced()
+        {
+            // An empty cell/row content control has nowhere to put a resolved value. Under ThrowException
+            // that must surface as an error, not be silently dropped.
+            const string body = @"
+                <w:tbl xmlns:w=""http://schemas.openxmlformats.org/wordprocessingml/2006/main"">
+                  <w:tr>
+                    <w:sdt>
+                      <w:sdtPr><w:tag w:val=""{{ds.X}}""/></w:sdtPr>
+                      <w:sdtContent><w:tc><w:tcPr><w:tcW w:w=""5000"" w:type=""dxa""/></w:tcPr><w:p/></w:tc></w:sdtContent>
+                    </w:sdt>
+                  </w:tr>
+                </w:tbl>";
+
+            using var template = new DocxTemplate(CreateTemplate(body),
+                new ProcessSettings { EnableContentControlTagBinding = true });
+            template.BindModel("ds", new { X = "value" });
 
             Assert.Throws<OpenXmlTemplateException>(() => template.Process());
         }
@@ -443,6 +498,9 @@ namespace DocxTemplater.Test
 
         private static MemoryStream RenderStream(Stream template, ProcessSettings settings, Action<DocxTemplate> bind)
         {
+            // This fixture exercises the feature, so binding is enabled for all render helpers. The
+            // flag-off behaviour is covered separately by PlaceholderTag_IsIgnored_WhenFlagDisabled.
+            settings.EnableContentControlTagBinding = true;
             using var docTemplate = new DocxTemplate(template, settings);
             bind(docTemplate);
             var processed = docTemplate.Process();
