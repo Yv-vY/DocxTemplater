@@ -15,6 +15,7 @@ _DocxTemplater is a library to generate docx documents from a docx template. The
 - Markdown Support - Converts Markdown to OpenXML
 - HTML Snippets - Replace placeholder with HTML Content
 - Dynamic Tables - Columns are defined by the datasource
+- Content Controls - Fill Word content controls from the model, addressed by their tag
 - Template Schema - Statically inspect which variables a template expects, without rendering
 
 ## Quickstart
@@ -412,6 +413,52 @@ The value in front of the formatter (here `ds`) is bound as `ds` *inside* the in
 ```
 
 **_NOTE:_** The content is inserted by copying the OpenXML body elements into the host document. Styles, numbering definitions and images stored in the inserted document's own parts are not imported.
+
+---
+## Content Controls
+
+A Word [content control](https://support.microsoft.com/en-us/office/create-a-template-9bc66f57-cbd0-4a2c-be7c-9b839d3a9019) (a *structured document tag*, `w:sdt`) can be filled from the model by putting a placeholder in its **tag**. Set the control's *Tag* (Developer tab → Properties → Tag) to a placeholder such as `{{ds.Name}}`, and DocxTemplater replaces the control's content with the resolved value.
+
+This is **opt-in** and off by default (existing templates may contain content-control tags never intended as placeholders). Enable it via `ProcessSettings.EnableContentControlTagBinding`:
+
+```csharp
+var template = DocxTemplate.Open("template.docx",
+    new ProcessSettings { EnableContentControlTagBinding = true });
+template.BindModel("ds", new { Name = "World", DeliveryDate = new DateTime(2026, 7, 8) });
+template.Save("generated.docx");
+```
+
+| Content control *Tag*                | Result                                              |
+| ------------------------------------ | --------------------------------------------------- |
+| `{{ds.Name}}`                        | Filled with the value of `ds.Name`.                 |
+| `{{ds.Name}:ToUpper()}`              | Formatters work exactly as in text placeholders.    |
+| `{{ds.DeliveryDate}:F('d MMM yyyy')}`| Date/number format strings are supported.           |
+
+The same model lookup and formatters as text placeholders are used, and content controls inside a loop are filled once per iteration (the tag resolves against the loop scope, e.g. `{{ds.Items}}` or `{{.Name}}`). A tag whose value resolves to `null` is treated like an unbound tag (see below).
+
+> [!NOTE]
+> Only formatters that produce **inline text** (e.g. `ToUpper`, `ToLower`, `format`, and C# expressions) are supported on a content control tag. Block-producing formatters (`html`, `md`, `img`, `template`) are not supported inside a content control - use them as normal text placeholders in the document body instead.
+
+Unlike a text placeholder, a content control is a **named, persistent region**:
+
+- The control and its tag are **never removed** and are **preserved** in the output, so the control stays addressable.
+- A control whose tag **cannot be bound** is **left unchanged** (under `SkipBindingAndRemoveContent`). This makes multi-pass filling safe - a control filled in an earlier pass is never cleared by a later pass that does not bind its tag:
+
+```csharp
+// Pass 1: generate the document, binding what is known now.
+var generated = Fill(templateBytes, new { Reference = "R-42" });
+
+// Pass 2 (later): stamp a value into a control that was left empty in pass 1,
+// without disturbing anything pass 1 already filled.
+var finalDoc = Fill(generated, new { DeliveryDate = "8 Jul 2026" });
+```
+
+- The control's "showing placeholder" flag is cleared on a successful fill, so Word shows the value as real text rather than grey placeholder text.
+
+A tag that is not a placeholder - or whose placeholder is a block directive such as `{{#items}}` - is ignored, so existing templates are unaffected. Placeholders in a content control's *content* (rather than its tag) keep working as normal text placeholders.
+
+> [!NOTE]
+> Content control tag bindings are not reported by `GetTemplateSchema()` (the tag is not part of the rendered text). This is the same limitation as sub-template formatters.
 
 ---
 ## Whitespace Trimming Around Directives

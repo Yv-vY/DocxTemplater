@@ -142,6 +142,12 @@ namespace DocxTemplater.Formatter
 
         public void ReplaceVariables(OpenXmlElement cloned, ITemplateProcessingContext templateContext)
         {
+            // Fill content controls (structured document tags) whose tag is a placeholder, before the
+            // text-placeholder pass. Runs from the same choke point so it applies to the root element and,
+            // because loop bodies are rendered by cloning their content and calling this method again, to
+            // every loop iteration as well.
+            ReplaceContentControlValues(cloned, templateContext);
+
             var variables = cloned.GetElementsWithMarker(PatternType.Variable)
                 .Concat(cloned.GetElementsWithMarker(PatternType.Expression))
                 .OfType<Text>().ToList();
@@ -180,6 +186,229 @@ namespace DocxTemplater.Formatter
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Fills Word content controls (structured document tags) whose <c>w:tag</c> is a DocxTemplater
+        /// placeholder (e.g. a tag of <c>{{ds.Name}}</c> or <c>{{ds.Price}:f(c)}</c>). The resolved model
+        /// value replaces the control's content using the same model lookup and formatters as text
+        /// placeholders, and the "showing placeholder" flag is cleared so Word treats the value as real text.
+        /// </summary>
+        /// <remarks>
+        /// Unlike a text placeholder, a content control is a named, persistent region: it is never removed,
+        /// and its tag is left untouched, so the control keeps its identity and can be filled again in a
+        /// later processing pass (e.g. stamping a delivery date after the document was generated and reviewed).
+        /// Tags that are not a placeholder - or whose placeholder is a block directive such as
+        /// <c>{{#items}}</c> - are ignored, so existing templates are unaffected.
+        /// </remarks>
+        private void ReplaceContentControlValues(OpenXmlElement root, ITemplateProcessingContext templateContext)
+        {
+            // Opt-in: content-control tag binding inspects the w:tag of pre-existing controls, which could
+            // change behavior of templates not authored for DocxTemplater. It is off unless explicitly enabled.
+            if (!ProcessSettings.EnableContentControlTagBinding)
+            {
+                return;
+            }
+
+            var contentControls = root.Descendants<SdtElement>().ToList();
+            if (root is SdtElement rootControl)
+            {
+                contentControls.Insert(0, rootControl);
+            }
+
+            foreach (var contentControl in contentControls)
+            {
+                var tag = contentControl.SdtProperties?.GetFirstChild<Tag>()?.Val?.Value;
+                if (string.IsNullOrEmpty(tag) || !tag.Contains("{{"))
+                {
+                    continue;
+                }
+
+                PatternMatch match;
+                try
+                {
+                    match = PatternMatcher.FindSyntaxPatterns(tag).FirstOrDefault();
+                }
+                catch (OpenXmlTemplateException)
+                {
+                    // The tag contains braces but is a malformed directive (e.g. "{{@}}" or "{{/switch}}"),
+                    // not a value binding. Treat it like any non-placeholder tag and leave the control
+                    // untouched, rather than letting the parse error abort the whole render.
+                    continue;
+                }
+
+                if (match == null || (match.Type != PatternType.Variable && match.Type != PatternType.Expression))
+                {
+                    continue;
+                }
+
+                FillContentControl(contentControl, tag, match, templateContext);
+            }
+        }
+
+        private void FillContentControl(SdtElement contentControl, string tag, PatternMatch match, ITemplateProcessingContext templateContext)
+        {
+            // Resolve the value BEFORE touching the control's content. If the tag cannot be bound, the
+            // control is left exactly as it was - see ApplyContentControlErrorMode. This is what makes
+            // multi-pass filling safe: a later pass that does not bind this tag must not clear a value a
+            // previous pass wrote.
+            object value;
+            try
+            {
+                value = match.Type == PatternType.Expression
+                    ? templateContext.ScriptCompiler.CompileExpression(match.Variable)()
+                    : m_models.GetValueWithMetadata(match.Variable);
+            }
+            catch (Exception e) when (e is OpenXmlTemplateException or FormatException)
+            {
+                ApplyContentControlErrorMode(contentControl, tag, e, preparedTarget: null);
+                return;
+            }
+
+            // A resolved-but-null value (a bound member that is simply null, as opposed to an absent one
+            // that throws above) is treated like an unbound tag: the control is left untouched. This keeps
+            // multi-pass filling non-destructive when passes share a model type whose other members are null.
+            var resolvedValue = match.Type == PatternType.Expression ? value : ((ValueWithMetadata)value).Value;
+            if (resolvedValue == null)
+            {
+                return;
+            }
+
+            var target = PrepareContentControlTarget(contentControl);
+            if (target == null)
+            {
+                // The value resolved but there is nowhere to put it (e.g. an empty cell/row content control).
+                // Surface this per the error mode instead of silently dropping the resolved value.
+                ApplyContentControlErrorMode(contentControl, tag,
+                    new OpenXmlTemplateException("the resolved value has no text run to fill (empty cell/row content controls are not supported)"),
+                    preparedTarget: null);
+                return;
+            }
+
+            try
+            {
+                if (match.Type == PatternType.Expression)
+                {
+                    ApplyFormatter(match, value, target, templateContext);
+                }
+                else
+                {
+                    ApplyFormatter(templateContext, match, (ValueWithMetadata)value, target);
+                }
+                SplitNewLinesInText(target);
+            }
+            catch (Exception e) when (e is OpenXmlTemplateException or FormatException)
+            {
+                ApplyContentControlErrorMode(contentControl, tag, e, target);
+                return;
+            }
+
+            RemoveShowingPlaceholder(contentControl);
+        }
+
+        /// <summary>
+        /// Applies the configured <see cref="BindingErrorHandling"/> to a content control whose tag could
+        /// not be resolved or formatted, without ever removing the control itself.
+        /// <paramref name="preparedTarget"/> is <c>null</c> when the failure happened before the content was
+        /// touched (value resolution): in that case the control is left completely unchanged under
+        /// <see cref="BindingErrorHandling.SkipBindingAndRemoveContent"/>.
+        /// </summary>
+        private void ApplyContentControlErrorMode(SdtElement contentControl, string tag, Exception e, Text preparedTarget)
+        {
+            switch (ProcessSettings.BindingErrorHandling)
+            {
+                case BindingErrorHandling.SkipBindingAndRemoveContent:
+                    if (preparedTarget is { } clearedTarget)
+                    {
+                        clearedTarget.Text = string.Empty;
+                    }
+                    break;
+                case BindingErrorHandling.HighlightErrorsInDocument:
+                    // For a resolution failure (no prepared target) highlight the control's existing content
+                    // in place WITHOUT clearing it, so the marker is visible and the original text is kept,
+                    // mirroring how a text placeholder is highlighted. For a formatting failure the target is
+                    // already prepared.
+                    var target = preparedTarget ?? FirstOwnText(contentControl);
+                    if (target != null)
+                    {
+                        MarkTextAsError(target);
+                    }
+                    AddError(e.Message);
+                    break;
+                default:
+                    throw new OpenXmlTemplateException($"Content control tag '{tag}' could not be replaced: {e.Message}", e);
+            }
+        }
+
+        /// <summary>
+        /// Reduces the content control's own content to a single, empty, unmarked <see cref="Text"/> that
+        /// the formatter pipeline can write into. The first existing text run is reused (so its formatting
+        /// is kept); any further text runs - and the now-empty runs/paragraphs around them - are dropped, so
+        /// no blank lines are left behind. Text belonging to a nested content control is never touched. An
+        /// empty inline/block control gets a minimal run so there is something to fill. Returns <c>null</c>
+        /// when the control has no place to put text (e.g. an empty cell/row control), leaving it untouched.
+        /// </summary>
+        private static Text PrepareContentControlTarget(SdtElement contentControl)
+        {
+            var content = contentControl.ChildElements
+                .FirstOrDefault(c => c is SdtContentBlock or SdtContentRun or SdtContentCell or SdtContentRow);
+            if (content == null)
+            {
+                return null;
+            }
+
+            var texts = OwnTexts(contentControl, content);
+            if (texts.Count > 0)
+            {
+                var target = texts[0];
+                for (var i = 1; i < texts.Count; i++)
+                {
+                    texts[i].RemoveWithEmptyParent();
+                }
+                // Drop a marker left by the isolate pass if the control's placeholder text happened to
+                // contain '{{...}}', so the text-placeholder pass does not process (and possibly remove) it.
+                target.RemoveMarker();
+                target.Text = string.Empty;
+                target.Space = SpaceProcessingModeValues.Preserve;
+                return target;
+            }
+
+            var newText = new Text { Space = SpaceProcessingModeValues.Preserve };
+            if (content is SdtContentRun)
+            {
+                content.AppendChild(new Run(newText));
+                return newText;
+            }
+            if (content is SdtContentBlock)
+            {
+                content.AppendChild(new Paragraph(new Run(newText)));
+                return newText;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// The <see cref="Text"/> nodes that belong directly to this content control - i.e. not to a
+        /// content control nested inside it. Scoping to the control's own text keeps an outer control from
+        /// consuming or corrupting the content of an inner one.
+        /// </summary>
+        private static List<Text> OwnTexts(SdtElement contentControl, OpenXmlElement content)
+        {
+            return content.Descendants<Text>()
+                .Where(t => t.Ancestors<SdtElement>().FirstOrDefault() == contentControl)
+                .ToList();
+        }
+
+        private static Text FirstOwnText(SdtElement contentControl)
+        {
+            var content = contentControl.ChildElements
+                .FirstOrDefault(c => c is SdtContentBlock or SdtContentRun or SdtContentCell or SdtContentRow);
+            return content == null ? null : OwnTexts(contentControl, content).FirstOrDefault();
+        }
+
+        private static void RemoveShowingPlaceholder(SdtElement contentControl)
+        {
+            contentControl.SdtProperties?.GetFirstChild<ShowingPlaceholder>()?.Remove();
         }
 
         /// <summary>
